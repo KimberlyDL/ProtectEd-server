@@ -1,0 +1,9 @@
+// server\.sequelizerc
+const path = require('path');
+
+module.exports = {
+    'config': path.resolve('src', 'config', 'db.js'), // CLI will look here for DB credentials
+    'models-path': path.resolve('src', 'model'),         // CLI will generate models here
+    'seeders-path': path.resolve('src', 'db', 'seeders'), // Optional
+    'migrations-path': path.resolve('src', 'db', 'migrations') // CLI will generate migrations here
+};
