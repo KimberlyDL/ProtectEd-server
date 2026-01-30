@@ -1,122 +1,98 @@
-// services/AvatarService.js
+// services/AvatarService.js (Refined Version)
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const sharp = require('sharp');
 const crypto = require('crypto');
 
+/**
+ * Specialized Avatar Service for User Profile Pictures
+ * 
+ * Features:
+ * - Image optimization and resizing
+ * - Format standardization (JPEG)
+ * - Automatic deletion of old avatars
+ * - Default avatar generation
+ * - Validation
+ */
 class AvatarService {
     constructor() {
-        // Initialize Cloudflare R2 client
         this.r2Client = new S3Client({
             region: 'auto',
-            endpoint: process.env.R2_ENDPOINT, // e.g., https://<account-id>.r2.cloudflarestorage.com
+            endpoint: process.env.R2_ENDPOINT,
             credentials: {
                 accessKeyId: process.env.R2_ACCESS_KEY_ID,
                 secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
             }
         });
-
         this.bucketName = process.env.R2_BUCKET_NAME;
-        this.publicUrl = process.env.R2_PUBLIC_URL; // e.g., https://avatars.yourdomain.com
+        this.publicUrl = process.env.R2_PUBLIC_URL;
     }
 
     /**
      * Upload avatar to Cloudflare R2
      * @param {Buffer} fileBuffer - The uploaded file buffer
      * @param {number} userId - User ID for folder organization
-     * @returns {Promise<string>} - Public URL of uploaded avatar
+     * @param {string} oldAvatarUrl - Previous avatar URL (to delete)
+     * @returns {Promise<Object>} - Upload result with public URL
      */
-    async uploadAvatar(fileBuffer, userId) {
+    async uploadAvatar(fileBuffer, userId, oldAvatarUrl = null) {
         try {
-            // Process image: resize, optimize, and convert to JPEG
+            if (oldAvatarUrl) await this.deleteAvatar(oldAvatarUrl);
+
             const processedImage = await sharp(fileBuffer)
-                .resize(400, 400, {
-                    fit: 'cover',
-                    position: 'center'
-                })
-                .jpeg({
-                    quality: 85,
-                    progressive: true
-                })
+                .resize(400, 400, { fit: 'cover' })
+                .jpeg({ quality: 80 })
                 .toBuffer();
 
-            // Generate unique filename
-            const hash = crypto.randomBytes(16).toString('hex');
-            const timestamp = Date.now();
-            const filename = `avatars/${userId}/${timestamp}-${hash}.jpg`;
+            const key = `avatars/${userId}/${Date.now()}.jpg`;
 
-            // Upload to R2
-            const command = new PutObjectCommand({
+            await this.r2Client.send(new PutObjectCommand({
                 Bucket: this.bucketName,
-                Key: filename,
+                Key: key,
                 Body: processedImage,
-                ContentType: 'image/jpeg',
-                CacheControl: 'public, max-age=31536000', // 1 year cache
-                Metadata: {
-                    userId: userId.toString(),
-                    uploadedAt: new Date().toISOString()
-                }
-            });
+                ContentType: 'image/jpeg'
+            }));
 
-            await this.r2Client.send(command);
-
-            // Return public URL
-            const publicUrl = `${this.publicUrl}/${filename}`;
-            return publicUrl;
-
+            return { url: `${this.publicUrl}/${key}`, key: key };
         } catch (error) {
-            console.error('Avatar upload error:', error);
-            throw new Error('Failed to upload avatar');
+            console.error("Avatar Service Error:", error);
+            throw error;
         }
     }
 
-    /**
-     * Delete avatar from Cloudflare R2
-     * @param {string} avatarUrl - The public URL of the avatar to delete
-     * @returns {Promise<boolean>} - Success status
-     */
     async deleteAvatar(avatarUrl) {
+        if (!avatarUrl || !avatarUrl.includes(this.publicUrl)) return;
+        const key = avatarUrl.replace(`${this.publicUrl}/`, '');
         try {
-            if (!avatarUrl || !avatarUrl.includes(this.publicUrl)) {
-                // Not a valid R2 URL, skip deletion
-                return false;
-            }
-
-            // Extract the key (filename) from the URL
-            const key = avatarUrl.replace(`${this.publicUrl}/`, '');
-
-            const command = new DeleteObjectCommand({
-                Bucket: this.bucketName,
-                Key: key
-            });
-
-            await this.r2Client.send(command);
-            return true;
-
-        } catch (error) {
-            console.error('Avatar deletion error:', error);
-            // Don't throw error on deletion failure
-            return false;
-        }
+            await this.r2Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: key }));
+        } catch (e) { console.error("Delete Error", e); }
     }
 
     /**
-     * Validate image file
+     * Validate avatar file
      * @param {Object} file - Multer file object
      * @returns {Object} - Validation result
      */
-    validateImage(file) {
+    validateAvatar(file) {
         const errors = [];
 
-        // Check file size (5MB max)
-        if (file.size > 5 * 1024 * 1024) {
-            errors.push('File size exceeds 5MB limit');
+        // Check if file exists
+        if (!file) {
+            errors.push('No file provided');
+            return { valid: false, errors };
+        }
+
+        // Check file size
+        if (file.size > this.config.maxFileSize) {
+            errors.push(`File size exceeds ${this._formatBytes(this.config.maxFileSize)} limit`);
         }
 
         // Check file type
-        const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg'];
-        if (!allowedTypes.includes(file.mimetype)) {
-            errors.push('Invalid file type. Only JPEG and PNG are allowed');
+        if (!this.config.allowedTypes.includes(file.mimetype)) {
+            errors.push('Invalid file type. Only JPEG, PNG, GIF, and WebP images are allowed');
         }
+
+        // Additional validation: check for minimum dimensions
+        // (This would require reading the image, so we'll skip for now)
 
         return {
             valid: errors.length === 0,
@@ -125,12 +101,155 @@ class AvatarService {
     }
 
     /**
-     * Get default avatar URL
+     * Get default avatar URL using external service
      * @param {string} name - User's name
+     * @param {Object} options - Additional options
      * @returns {string} - Default avatar URL
      */
-    getDefaultAvatar(name = 'User') {
-        return `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random&size=400`;
+    getDefaultAvatar(name = 'User', options = {}) {
+        const {
+            size = 400,
+            background = 'random',  // or specific color like '0D8ABC'
+            color = 'ffffff',       // text color
+            rounded = false,
+            bold = true
+        } = options;
+
+        const params = new URLSearchParams({
+            name: name,
+            background: background,
+            color: color,
+            size: size,
+            rounded: rounded,
+            bold: bold
+        });
+
+        return `https://ui-avatars.com/api/?${params.toString()}`;
+    }
+
+    /**
+     * Get avatar URL or default
+     * @param {string|null} avatarUrl - User's avatar URL
+     * @param {string} userName - User's name for default avatar
+     * @returns {string} - Avatar URL
+     */
+    getAvatarOrDefault(avatarUrl, userName) {
+        return avatarUrl || this.getDefaultAvatar(userName);
+    }
+
+    // ==================== PRIVATE HELPER METHODS ====================
+
+    /**
+     * Process image: resize, optimize, convert to JPEG
+     * @private
+     */
+    async _processImage(buffer) {
+        try {
+            const image = sharp(buffer);
+            const metadata = await image.metadata();
+
+            // For images with transparency (like PNGs with alpha channel),
+            // add a white background before converting to JPEG
+            let processedImage = image;
+
+            if (metadata.hasAlpha) {
+                processedImage = processedImage.flatten({ background: '#ffffff' });
+            }
+
+            // Resize and optimize
+            const result = await processedImage
+                .resize(this.config.size, this.config.size, {
+                    fit: 'cover',
+                    position: 'center'
+                })
+                .jpeg({
+                    quality: this.config.quality,
+                    progressive: true,
+                    mozjpeg: true  // Use mozjpeg for better compression
+                })
+                .toBuffer();
+
+            return result;
+
+        } catch (error) {
+            console.error('Image processing error:', error);
+            throw new Error('Failed to process image');
+        }
+    }
+
+    /**
+     * Upload processed image to R2
+     * @private
+     */
+    async _uploadToR2(buffer, filename, userId) {
+        try {
+            const command = new PutObjectCommand({
+                Bucket: this.bucketName,
+                Key: filename,
+                Body: buffer,
+                ContentType: 'image/jpeg',
+                CacheControl: 'public, max-age=31536000, immutable', // 1 year cache
+                Metadata: {
+                    userId: userId.toString(),
+                    uploadedAt: new Date().toISOString(),
+                    type: 'avatar'
+                }
+            });
+
+            await this.r2Client.send(command);
+
+            // Construct and return public URL
+            const publicUrl = `${this.publicUrl}/${filename}`;
+
+            return {
+                url: publicUrl,
+                key: filename,
+                size: buffer.length,
+                uploadedAt: new Date().toISOString()
+            };
+
+        } catch (error) {
+            console.error('R2 upload error:', error);
+            throw new Error('Failed to upload to R2');
+        }
+    }
+
+    /**
+     * Generate unique filename
+     * @private
+     */
+    _generateFilename(userId) {
+        const hash = crypto.randomBytes(16).toString('hex');
+        const timestamp = Date.now();
+        return `avatars/${userId}/${timestamp}-${hash}.jpg`;
+    }
+
+    /**
+     * Check if URL is from R2
+     * @private
+     */
+    _isR2Url(url) {
+        return url && url.includes(this.publicUrl);
+    }
+
+    /**
+     * Extract key from R2 URL
+     * @private
+     */
+    _extractKeyFromUrl(url) {
+        return url.replace(`${this.publicUrl}/`, '');
+    }
+
+    /**
+     * Format bytes to human readable
+     * @private
+     */
+    _formatBytes(bytes) {
+        if (bytes === 0) return '0 Bytes';
+        const k = 1024;
+        const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
     }
 }
 

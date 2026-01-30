@@ -335,15 +335,50 @@ class JWTService {
         return jwt.sign({ id: user.id, type: 'email_verification' }, this.accessSecret, { expiresIn: '24h' });
     }
 
+    // generateResetToken(user) {
+    //     // 🟢 Use a slice of the current password hash as a 'secret' piece of the payload
+    //     const secretPart = user.password.substring(user.password.length - 10);
+
+    //     return jwt.sign(
+    //         {
+    //             id: user.id,
+    //             type: 'password_reset',
+    //             version: secretPart // This token version is tied to the current password
+    //         },
+    //         this.accessSecret,
+    //         { expiresIn: '1h' }
+    //     );
+    // }
+
+    // verifyActionToken(token, type, user = null) {
+    //     const decoded = jwt.verify(token, this.accessSecret);
+
+    //     if (decoded.type !== type) throw new Error('Invalid token type');
+
+    //     // 🟢 If it's a reset token, verify it still matches the user's current password
+    //     if (type === 'password_reset' && user) {
+    //         const currentSecretPart = user.password.substring(user.password.length - 10);
+    //         if (decoded.version !== currentSecretPart) {
+    //             throw new Error('This reset link has already been used or is outdated.');
+    //         }
+    //     }
+
+    //     return decoded;
+    // }
+
     generateResetToken(user) {
-        // 🟢 Use a slice of the current password hash as a 'secret' piece of the payload
+        // Check if password exists to avoid the 'substring' error
+        if (!user.password) {
+            throw new Error('User has no password set (OAuth user) or password was not loaded.');
+        }
+
         const secretPart = user.password.substring(user.password.length - 10);
 
         return jwt.sign(
             {
                 id: user.id,
                 type: 'password_reset',
-                version: secretPart // This token version is tied to the current password
+                version: secretPart
             },
             this.accessSecret,
             { expiresIn: '1h' }
@@ -355,11 +390,15 @@ class JWTService {
 
         if (decoded.type !== type) throw new Error('Invalid token type');
 
-        // 🟢 If it's a reset token, verify it still matches the user's current password
         if (type === 'password_reset' && user) {
+            // Guard against missing password hash
+            if (!user.password) {
+                throw new Error('User password data is missing.');
+            }
+
             const currentSecretPart = user.password.substring(user.password.length - 10);
             if (decoded.version !== currentSecretPart) {
-                throw new Error('This reset link has already been used or is outdated.');
+                throw new Error('Link invalid or expired. Please request a new one.');
             }
         }
 

@@ -1,5 +1,6 @@
 // controllers/ProfileController.js
-const { User, UserProfile, UserGuardian, UserPrivacySettings } = require('../model');
+const { User, UserProfile, UserGuardian, UserPrivacySettings, sequelize } = require('../model');
+const fileStorageService = require('../services/FileStorageService');
 
 /**
  * Get user profile (public or own)
@@ -38,14 +39,17 @@ exports.getProfile = async (req, res, next) => {
 
         // Viewing own profile - return full info
         if (targetUserId == requesterId) {
-            const guardians = await UserGuardian.findUserGuardians(targetUserId);
+            const guardians = await UserGuardian.findAll({
+                where: { user_id: targetUserId },
+                order: [['is_primary', 'DESC'], ['created_at', 'ASC']]
+            });
 
             return res.json({
                 id: targetUser.id,
                 email: targetUser.email,
                 name: targetUser.name,
                 role: targetUser.role,
-                avatar_url: targetUser.getAvatarUrl(),
+                avatar_url: targetUser.getAvatarUrl(), // Uses method from User model
                 is_profile_public: targetUser.is_profile_public,
                 account_status: targetUser.account_status,
                 created_at: targetUser.created_at,
@@ -101,7 +105,6 @@ exports.getProfile = async (req, res, next) => {
             sex: targetUser.profile?.sex || null,
             avatar_url: targetUser.getAvatarUrl(),
             is_profile_public: true,
-            // Achievements would be loaded here if show_achievements is true
             achievements: [] // TODO: Load from achievements table
         });
 
@@ -197,52 +200,137 @@ exports.updateProfile = async (req, res, next) => {
 };
 
 /**
- * Upload avatar (handled separately with file upload)
+ * Upload Avatar - WITH PROPER TRANSACTION & ERROR HANDLING
  */
 exports.uploadAvatar = async (req, res, next) => {
+    const transaction = await sequelize.transaction();
+
     try {
+        // 1. Validate file exists
         if (!req.file) {
             return res.status(400).json({
                 message: 'No file uploaded'
             });
         }
 
-        // Avatar upload logic will be in AvatarService
-        // For now, just return the file path
-        const avatarUrl = req.file.path; // This will be replaced with Cloudflare URL
+        // 2. Validate file (size, type, extension)
+        const validation = fileStorageService.validateFile({
+            buffer: req.file.buffer,
+            size: req.file.size,
+            mimetype: req.file.mimetype,
+            originalFilename: req.file.originalname
+        }, 'avatar');
 
-        // Update user's avatar_url
-        const user = await User.findByPk(req.user.id);
-        user.avatar_url = avatarUrl;
-        await user.save();
+        if (!validation.valid) {
+            return res.status(400).json({
+                message: 'File validation failed',
+                errors: validation.errors
+            });
+        }
 
-        res.json({
-            message: 'Avatar uploaded successfully',
-            avatar_url: avatarUrl
+        // 3. Get user with lock (prevent race conditions)
+        const user = await User.findByPk(req.user.id, {
+            lock: transaction.LOCK.UPDATE,
+            transaction
         });
+
+        if (!user) {
+            await transaction.rollback();
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        // 4. Store old avatar KEY (not URL) for cleanup
+        const oldAvatarKey = user.avatar_key;
+
+        // 5. Upload new avatar
+        const result = await fileStorageService.uploadAvatar(
+            req.file.buffer,
+            user.id,
+            oldAvatarKey  // Pass key, not URL
+        );
+
+        // 6. Update database with NEW KEY (not URL)
+        user.avatar_key = result.key;  // Store ONLY the key
+        await user.save({ transaction });
+
+        // 7. Commit transaction
+        await transaction.commit();
+
+        // 8. Return URL for immediate display
+        res.json({
+            message: 'Avatar updated successfully',
+            avatar_url: result.url,  // Frontend uses this
+            avatar_key: result.key   // For debugging
+        });
+
     } catch (error) {
+        // Rollback on any error
+        await transaction.rollback();
+
+        console.error('Avatar upload error:', error);
+
+        // Provide user-friendly error messages
+        if (error.message.includes('File validation failed')) {
+            return res.status(400).json({
+                message: error.message
+            });
+        }
+
+        if (error.message.includes('Failed to upload')) {
+            return res.status(500).json({
+                message: 'Failed to upload avatar. Please try again.'
+            });
+        }
+
         next(error);
     }
 };
 
 /**
- * Delete avatar
+ * Delete Avatar - WITH PROPER CLEANUP
  */
 exports.deleteAvatar = async (req, res, next) => {
+    const transaction = await sequelize.transaction();
+
     try {
-        const user = await User.findByPk(req.user.id);
+        // 1. Get user with lock
+        const user = await User.findByPk(req.user.id, {
+            lock: transaction.LOCK.UPDATE,
+            transaction
+        });
 
-        // Delete from Cloudflare if exists
-        // TODO: Implement AvatarService.deleteAvatar(user.avatar_url)
+        if (!user) {
+            await transaction.rollback();
+            return res.status(404).json({ message: 'User not found' });
+        }
 
-        user.avatar_url = null;
-        await user.save();
+        // 2. Delete from R2 if exists
+        if (user.avatar_key) {
+            try {
+                await fileStorageService.deleteFile(user.avatar_key);
+            } catch (deleteError) {
+                console.error('Failed to delete avatar from R2:', deleteError);
+                // Continue anyway - update database even if R2 delete fails
+            }
+        }
+
+        // 3. Clear avatar_key in database
+        user.avatar_key = null;
+        await user.save({ transaction });
+
+        // 4. Commit transaction
+        await transaction.commit();
+
+        // 5. Return default avatar URL
+        const defaultAvatarUrl = user.getAvatarUrl(); // Should return default
 
         res.json({
             message: 'Avatar removed successfully',
-            avatar_url: user.getAvatarUrl() // Returns default avatar
+            avatar_url: defaultAvatarUrl
         });
+
     } catch (error) {
+        await transaction.rollback();
         next(error);
     }
 };

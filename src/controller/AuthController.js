@@ -1,4 +1,5 @@
 const { User } = require('../model');
+const jwt = require('jsonwebtoken');
 const jwtService = require('../services/JwtService');
 const { getDeviceInfo } = require('../middleware/AuthMiddleware');
 const emailService = require('../services/EmailService');
@@ -489,7 +490,9 @@ exports.verifyEmail = async (req, res, next) => {
 exports.forgotPassword = async (req, res, next) => {
     try {
         const { email } = req.body;
-        const user = await User.findOne({ where: { email } });
+        // const user = await User.findOne({ where: { email } });
+
+        const user = await User.scope('withPassword').findOne({ where: { email } });
 
         // Security: Don't reveal if user exists
         if (user) {
